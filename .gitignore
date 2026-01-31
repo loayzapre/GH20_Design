@@ -14,7 +14,7 @@ data/
 *.tsv
 *.csv
 *.log
-output/
+outputs/
 
 # Notebooks
 .ipynb_checkpoints/

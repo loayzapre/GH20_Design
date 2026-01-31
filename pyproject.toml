@@ -5,14 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gh20-pipeline"
 version = "0.1.0"
-description = "GH20 pipeline: CAZy → curated FASTA → SSN → clustering → MD"
+description = "Protein family pipeline: TXT -> curated FASTA -> SSN -> clustering -> consensus"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "pandas",
-  "biopython",
-  "requests",
-  "tqdm"
+  "pandas>=2.0",
+  "biopython>=1.80",
+  "requests>=2.31",
+  "tqdm>=4.66",
+  "networkx>=3.0",
+  "matplotlib>=3.7",
+  "plotly>=5.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ipykernel",
+  "jupyterlab",
+  "pytest",
+  "ruff",
 ]
 
 [tool.setuptools]

@@ -1,115 +1,220 @@
-# src/gh20_design/database.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Dict, Tuple
+from typing import Iterator, Tuple, Optional, List
+import shutil
+import subprocess
 
-import pandas as pd
 
+# -------------------------
+# FASTA I/O (simple, fast)
+# -------------------------
+
+def iter_fasta(fasta_path: str | Path) -> Iterator[Tuple[str, str]]:
+    """Yield (header_without_>, sequence) from a FASTA file."""
+    fasta_path = Path(fasta_path)
+    header: Optional[str] = None
+    seq_chunks: List[str] = []
+
+    with fasta_path.open("r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(seq_chunks)
+                header = line[1:].strip()
+                seq_chunks = []
+            else:
+                seq_chunks.append(line)
+
+        if header is not None:
+            yield header, "".join(seq_chunks)
+
+
+def write_fasta(records: Iterator[Tuple[str, str]], out_path: str | Path, wrap: int = 80) -> int:
+    """
+    Write FASTA records and return how many sequences were written.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _wrap(seq: str) -> str:
+        if wrap <= 0:
+            return seq + "\n"
+        return "\n".join(seq[i:i+wrap] for i in range(0, len(seq), wrap)) + "\n"
+
+    n = 0
+    with out_path.open("w", encoding="utf-8") as f:
+        for header, seq in records:
+            f.write(f">{header}\n")
+            f.write(_wrap(seq))
+            n += 1
+    return n
+
+
+# -------------------------
+# Length filtering
+# -------------------------
 
 @dataclass
 class LengthFilterConfig:
-    """Filter out extreme sequence lengths using percentiles."""
-    low_q: float = 0.05
-    high_q: float = 0.95
-    min_len: Optional[int] = None  # optional hard cutoff
-    max_len: Optional[int] = None  # optional hard cutoff
+    min_len: int = 200
+    max_len: Optional[int] = None
+    drop_ambiguous: bool = False  # drop sequences containing non-standard AA chars
+    wrap: int = 80
 
+
+def _is_standard_protein(seq: str) -> bool:
+    """
+    Very simple protein alphabet check.
+    Allows X by default; adjust if needed.
+    """
+    allowed = set("ACDEFGHIKLMNPQRSTVWYXBZU")  # includes X, B, Z, U
+    return all((c in allowed) for c in seq.upper())
+
+
+def length_filter_fasta(
+    in_fasta: str | Path,
+    out_fasta: str | Path,
+    cfg: LengthFilterConfig,
+) -> dict:
+    """
+    Filter sequences by length (and optionally by allowed alphabet).
+
+    Returns summary dict.
+    """
+    in_fasta = Path(in_fasta)
+    out_fasta = Path(out_fasta)
+
+    kept = 0
+    dropped_short = 0
+    dropped_long = 0
+    dropped_amb = 0
+    total = 0
+
+    def gen():
+        nonlocal kept, dropped_short, dropped_long, dropped_amb, total
+        for header, seq in iter_fasta(in_fasta):
+            total += 1
+            L = len(seq)
+            if L < cfg.min_len:
+                dropped_short += 1
+                continue
+            if cfg.max_len is not None and L > cfg.max_len:
+                dropped_long += 1
+                continue
+            if cfg.drop_ambiguous and not _is_standard_protein(seq):
+                dropped_amb += 1
+                continue
+            kept += 1
+            yield header, seq
+
+    write_fasta(gen(), out_fasta, wrap=cfg.wrap)
+
+    return {
+        "input": str(in_fasta),
+        "output": str(out_fasta),
+        "total": total,
+        "kept": kept,
+        "dropped_short": dropped_short,
+        "dropped_long": dropped_long,
+        "dropped_ambiguous": dropped_amb,
+        "min_len": cfg.min_len,
+        "max_len": cfg.max_len,
+        "drop_ambiguous": cfg.drop_ambiguous,
+    }
+
+
+# -------------------------
+# CD-HIT wrapper
+# -------------------------
 
 @dataclass
-class DatabaseBuildConfig:
-    family: str = "GH20"
-    length_filter: LengthFilterConfig = LengthFilterConfig()
-    out_dir: Path = Path("outputs/database")
-    cache_dir: Path = Path("outputs/cache")
-    add_taxonomy: bool = True
-    # CD-HIT identity cutoffs you mentioned (100, 95, 90); keep last as downstream
-    cdhit_cutoffs: Tuple[float, ...] = (1.00, 0.95, 0.90)
+class CDHitConfig:
+    identity: float = 0.90  # -c
+    word_length: Optional[int] = None  # -n (auto if None)
+    threads: int = 8  # -T
+    memory_mb: int = 16000  # -M (MB)
+    description_len: int = 0  # -d 0 keeps full header (recommended)
+    extra_args: Optional[list[str]] = None
 
 
-def clean_species_name(name: str) -> str:
-    """Normalize species names (keep your current rules)."""
-    # TODO: paste your rules from the notebook version
-    return " ".join(str(name).strip().split())
+def _auto_word_length(identity: float) -> int:
+    """
+    Reasonable defaults for cd-hit -n given -c.
+    cd-hit requires specific combos; these are common choices:
+      -c 0.7-1.0 with -n 2..5
+    """
+    if identity >= 0.9:
+        return 5
+    if identity >= 0.88:
+        return 5
+    if identity >= 0.85:
+        return 4
+    if identity >= 0.8:
+        return 4
+    return 3
 
 
-def is_valid_protein(seq: str) -> bool:
-    """Basic protein sanity checks."""
-    if not isinstance(seq, str):
-        return False
-    seq = seq.strip().upper()
-    if len(seq) == 0:
-        return False
-    # keep only typical AA + X (unknown); tune if you used other rules
-    allowed = set("ACDEFGHIKLMNPQRSTVWYXBZUOJ")
-    return all(c in allowed for c in seq)
+def run_cdhit(
+    in_fasta: str | Path,
+    out_fasta: str | Path,
+    cfg: CDHitConfig,
+    executable: str = "cd-hit",
+) -> dict:
+    """
+    Run cd-hit on a protein FASTA.
 
-
-def filter_length(df: pd.DataFrame, cfg: LengthFilterConfig) -> pd.DataFrame:
-    """Percentile-based length filter + optional hard min/max."""
-    if "length" not in df.columns:
-        raise ValueError("Expected a 'length' column.")
-
-    low = int(df["length"].quantile(cfg.low_q))
-    high = int(df["length"].quantile(cfg.high_q))
-
-    lo = cfg.min_len if cfg.min_len is not None else low
-    hi = cfg.max_len if cfg.max_len is not None else high
-
-    return df[(df["length"] >= lo) & (df["length"] <= hi)].copy()
-
-
-def fasta_from_dataframe(df: pd.DataFrame, out_fasta: Path, id_col: str = "id", seq_col: str = "sequence") -> None:
-    """Write FASTA from a dataframe."""
+    Produces:
+      out_fasta
+      out_fasta + ".clstr"
+    """
+    in_fasta = Path(in_fasta)
+    out_fasta = Path(out_fasta)
     out_fasta.parent.mkdir(parents=True, exist_ok=True)
-    with out_fasta.open("w", encoding="utf-8") as f:
-        for _, row in df.iterrows():
-            f.write(f">{row[id_col]}\n{row[seq_col]}\n")
 
+    exe = shutil.which(executable)
+    if exe is None:
+        raise FileNotFoundError(
+            f"'{executable}' not found on PATH. Install cd-hit or load the module, then retry."
+        )
 
-# ---------- HIGH-LEVEL PIPELINE ----------
+    n = cfg.word_length if cfg.word_length is not None else _auto_word_length(cfg.identity)
 
-def build_gh20_database(
-    identifiers_df: pd.DataFrame,
-    cfg: DatabaseBuildConfig,
-) -> pd.DataFrame:
-    """
-    Build curated GH20 database dataframe and write key outputs.
+    cmd = [
+        exe,
+        "-i", str(in_fasta),
+        "-o", str(out_fasta),
+        "-c", str(cfg.identity),
+        "-n", str(n),
+        "-T", str(cfg.threads),
+        "-M", str(cfg.memory_mb),
+        "-d", str(cfg.description_len),
+    ]
+    if cfg.extra_args:
+        cmd.extend(cfg.extra_args)
 
-    Expected identifiers_df columns depend on your CAZy scraping step, but typically:
-      - 'id' (unique protein id / accession)
-      - 'sequence' (if already fetched) OR fields to fetch sequences
-      - optional taxonomy fields
-    """
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    df = identifiers_df.copy()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "cd-hit failed.\n"
+            f"Command: {' '.join(cmd)}\n\n"
+            f"STDOUT:\n{proc.stdout}\n\n"
+            f"STDERR:\n{proc.stderr}\n"
+        )
 
-    # If your pipeline fills sequences later, call your fill_sequence function here.
-    # df = fill_sequence_indatabase(df, ...)
-
-    # Clean + validate
-    if "sequence" not in df.columns:
-        raise ValueError("identifiers_df must contain a 'sequence' column at this stage.")
-
-    df["sequence"] = df["sequence"].astype(str).str.strip()
-    df = df[df["sequence"].map(is_valid_protein)].copy()
-    df["length"] = df["sequence"].str.len()
-
-    # Length filter (percentiles like your Chapter III description) :contentReference[oaicite:1]{index=1}
-    df = filter_length(df, cfg.length_filter)
-
-    # Optional: taxonomy step (keep your own implementation; call it here)
-    if cfg.add_taxonomy:
-        # df = add_taxonomy_to_db(df, cache_dir=cfg.cache_dir)
-        pass
-
-    # Save curated table + FASTA
-    out_tsv = cfg.out_dir / f"{cfg.family}_curated.tsv"
-    out_fasta = cfg.out_dir / f"{cfg.family}_curated.fasta"
-    df.to_csv(out_tsv, sep="\t", index=False)
-    fasta_from_dataframe(df, out_fasta, id_col="id", seq_col="sequence")
-
-    return df
+    return {
+        "input": str(in_fasta),
+        "output": str(out_fasta),
+        "clusters_file": str(out_fasta) + ".clstr",
+        "identity": cfg.identity,
+        "word_length": n,
+        "threads": cfg.threads,
+        "memory_mb": cfg.memory_mb,
+        "stdout_tail": proc.stdout[-1000:],
+        "stderr_tail": proc.stderr[-1000:],
+    }
